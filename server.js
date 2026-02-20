@@ -40,16 +40,17 @@ async function openWhatsAppWindow() {
     page = null;
   }
   initialPageReadyPromise = null;
-  browser = await puppeteer.launch({
-    headless: false,
-    defaultViewport: null,
-    args: [
-      '--start-maximized',
-      '--no-sandbox',
-      '--window-size=1280,800',
-      '--window-position=50,50',
-    ],
-  });
+ const browser = await puppeteer.launch({
+	  headless: true,
+	  args: [
+		'--no-sandbox',
+		'--disable-setuid-sandbox',
+		'--disable-dev-shm-usage',
+		'--disable-gpu',
+		'--no-zygote',
+		'--single-process'
+	  ]
+	});
   page = await browser.newPage();
   initialPageReadyPromise = page.goto('https://web.whatsapp.com', { waitUntil: 'networkidle2', timeout: 60000 });
   await initialPageReadyPromise;
