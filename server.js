@@ -18,7 +18,9 @@ const DAILY_LIMIT = 30;
 const DELAY_MS = 1500;
 const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
 
-let browser, page;
+
+let browser = null;
+let page = null;
 let initialPageReadyPromise = null;
 let dailyCount = 0;
 let lastResetDate = new Date().toDateString();
@@ -40,17 +42,19 @@ async function openWhatsAppWindow() {
     page = null;
   }
   initialPageReadyPromise = null;
- const browser = await puppeteer.launch({
-	  headless: true,
-	  args: [
-		'--no-sandbox',
-		'--disable-setuid-sandbox',
-		'--disable-dev-shm-usage',
-		'--disable-gpu',
-		'--no-zygote',
-		'--single-process'
-	  ]
-	});
+
+  browser = await puppeteer.launch({   // ✅ no 'const' here
+    headless: true,
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-gpu',
+      '--no-zygote',
+      '--single-process'
+    ]
+  });
+
   page = await browser.newPage();
   initialPageReadyPromise = page.goto('https://web.whatsapp.com', { waitUntil: 'networkidle2', timeout: 60000 });
   await initialPageReadyPromise;
@@ -59,7 +63,6 @@ async function openWhatsAppWindow() {
     await page.bringToFront();
   } catch (e) {}
 }
-
 app.post('/send-invoice', async (req, res) => {
   try {
     resetDailyCountIfNewDay();
