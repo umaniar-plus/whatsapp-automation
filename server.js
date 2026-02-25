@@ -2,7 +2,7 @@
  * WhatsApp Automation Service (Express + Puppeteer)
  * - Run once: opens WhatsApp Web, scan QR and keep browser open.
  * - POST /send-invoice: receives phone, file_path, message from Odoo; attaches PDF and sends.
- * Run: npm start  (then keep this running; Odoo calls http://localhost:3000/send-invoice)
+ * Run: npm start  (then keep this running; Odoos calls http://localhost:3000/send-invoice)
  */
 
 const express = require('express');
