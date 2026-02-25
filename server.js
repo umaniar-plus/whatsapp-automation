@@ -1,8 +1,10 @@
 /**
  * WhatsApp Automation Service (Express + Puppeteer)
- * - Run once: opens WhatsApp Web, scan QR and keep browser open.
- * - POST /send-invoice: receives phone, file_path, message from Odoo; attaches PDF and sends.
- * Run: npm start  (then keep this running; Odoos calls http://localhost:3000/send-invoice)
+ * - Persistent session via userDataDir (scan QR only once)
+ * - GET  /qr            → returns QR code as base64 PNG (use when not logged in)
+ * - GET  /status        → check login state
+ * - GET  /health        → check service health
+ * - POST /send-invoice  → send PDF via WhatsApp
  */
 
 const express = require('express');
@@ -16,12 +18,12 @@ app.use(bodyParser.json());
 
 const DAILY_LIMIT = 30;
 const DELAY_MS = 1500;
+const SESSION_DIR = path.join(process.env.HOME || '/home/odoo', 'whatsapp-session');
 const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
-
 
 let browser = null;
 let page = null;
-let initialPageReadyPromise = null;
+let isLoggedIn = false;
 let dailyCount = 0;
 let lastResetDate = new Date().toDateString();
 
@@ -33,43 +35,140 @@ function resetDailyCountIfNewDay() {
   }
 }
 
+const LOGGED_IN_SELECTORS = [
+  '[data-testid="chat-list"]',
+  '#pane-side',
+  '#side',
+  'header [data-testid="search"]',
+  '[data-testid="default-user"]',
+  '[data-testid="menu-bar-menu"]',
+  'aside',
+  'div[contenteditable="true"][data-tab="1"]',
+];
+
+async function checkLoggedIn() {
+  try {
+    if (!page || page.isClosed()) return false;
+    return await page.evaluate(
+      (sels) => sels.some((s) => document.querySelector(s)),
+      LOGGED_IN_SELECTORS
+    );
+  } catch (e) {
+    return false;
+  }
+}
+
 async function openWhatsAppWindow() {
-  if (browser && browser.connected) {
-    try {
-      await browser.close();
-    } catch (e) {}
+  // Close existing browser if any
+  if (browser) {
+    try { await browser.close(); } catch (e) {}
     browser = null;
     page = null;
+    isLoggedIn = false;
   }
-  initialPageReadyPromise = null;
 
-  browser = await puppeteer.launch({   // ✅ no 'const' here
+  // Ensure session directory exists
+  if (!fs.existsSync(SESSION_DIR)) {
+    fs.mkdirSync(SESSION_DIR, { recursive: true });
+  }
+
+  console.log('🚀 Launching browser with session dir:', SESSION_DIR);
+
+  browser = await puppeteer.launch({
     headless: true,
+    userDataDir: SESSION_DIR,   // ← persistent session: scan QR only once
     args: [
       '--no-sandbox',
       '--disable-setuid-sandbox',
       '--disable-dev-shm-usage',
       '--disable-gpu',
       '--no-zygote',
-      '--single-process'
-    ]
+      '--single-process',
+      '--disable-software-rasterizer',
+    ],
   });
 
   page = await browser.newPage();
-  initialPageReadyPromise = page.goto('https://web.whatsapp.com', { waitUntil: 'networkidle2', timeout: 60000 });
-  await initialPageReadyPromise;
-  initialPageReadyPromise = null;
-  try {
-    await page.bringToFront();
-  } catch (e) {}
+  await page.setUserAgent(
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+  );
+
+  console.log('📱 Opening WhatsApp Web...');
+  await page.goto('https://web.whatsapp.com', { waitUntil: 'networkidle2', timeout: 60000 });
+  await sleep(3000);
+
+  isLoggedIn = await checkLoggedIn();
+  if (isLoggedIn) {
+    console.log('✅ Already logged in via saved session!');
+  } else {
+    console.log('⚠️  Not logged in. Call GET /qr to get QR code and scan it.');
+    // Save QR screenshot automatically
+    try {
+      const qrPath = path.join(process.env.HOME || '/home/odoo', 'whatsapp-automation', 'qr.png');
+      await page.screenshot({ path: qrPath, fullPage: true });
+      console.log('📸 QR screenshot saved to:', qrPath);
+    } catch (e) {
+      console.log('Could not save QR screenshot:', e.message);
+    }
+  }
 }
+
+// ─── GET /qr ─────────────────────────────────────────────────────────────────
+// Returns QR code as base64 PNG so you can view it in browser or download
+app.get('/qr', async (req, res) => {
+  try {
+    if (!page || page.isClosed()) {
+      return res.status(503).json({ error: 'Browser not ready' });
+    }
+
+    isLoggedIn = await checkLoggedIn();
+    if (isLoggedIn) {
+      return res.json({ status: 'already_logged_in', message: 'WhatsApp is already logged in. No QR needed.' });
+    }
+
+    // Take screenshot and return as base64
+    const screenshot = await page.screenshot({ encoding: 'base64', fullPage: false });
+    res.send(`
+      <html>
+        <body style="background:#111;display:flex;flex-direction:column;align-items:center;padding:20px">
+          <h2 style="color:white">Scan this QR with WhatsApp</h2>
+          <p style="color:#aaa">WhatsApp → Settings → Linked Devices → Link a Device</p>
+          <img src="data:image/png;base64,${screenshot}" style="max-width:600px;border:4px solid #25D366;border-radius:8px"/>
+          <p style="color:#aaa;margin-top:20px">Refresh this page after scanning to confirm login</p>
+          <a href="/status" style="color:#25D366">Check login status →</a>
+        </body>
+      </html>
+    `);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── GET /status ──────────────────────────────────────────────────────────────
+app.get('/status', async (req, res) => {
+  isLoggedIn = await checkLoggedIn();
+  res.json({
+    loggedIn: isLoggedIn,
+    browser: !!browser,
+    page: !!page && !page.isClosed(),
+    dailyCount,
+    limit: DAILY_LIMIT,
+    sessionDir: SESSION_DIR,
+  });
+});
+
+// ─── GET /health ──────────────────────────────────────────────────────────────
+app.get('/health', (req, res) => {
+  if (!page) return res.status(503).json({ ok: false, error: 'Browser not ready' });
+  res.json({ ok: true, browser: !!browser, page: !!page, loggedIn: isLoggedIn, dailyCount, limit: DAILY_LIMIT });
+});
+
+// ─── POST /send-invoice ───────────────────────────────────────────────────────
 app.post('/send-invoice', async (req, res) => {
   try {
     resetDailyCountIfNewDay();
     if (dailyCount >= DAILY_LIMIT) {
-      return res.status(429).json({
-        error: `Daily send limit reached (${DAILY_LIMIT}). Try again tomorrow.`,
-      });
+      return res.status(429).json({ error: `Daily limit reached (${DAILY_LIMIT}). Try again tomorrow.` });
     }
 
     const { phone, file_path, message } = req.body;
@@ -77,339 +176,225 @@ app.post('/send-invoice', async (req, res) => {
       return res.status(400).json({ error: 'Missing phone or file_path' });
     }
 
-    // Use ONLY the invoice PDF path from Odoo — no manual attachment; this file is what we attach
-    const normalized = (typeof file_path === 'string' ? file_path : String(file_path)).trim().replace(/\//g, path.sep);
-    const resolvedPath = path.resolve(normalized);
+    const resolvedPath = path.resolve(String(file_path).trim());
     if (!fs.existsSync(resolvedPath)) {
       return res.status(400).json({ error: 'File not found: ' + resolvedPath });
     }
 
-    // If window was closed, reopen WhatsApp Web (QR page) so user can scan again
-    const needReopen = !browser || !browser.connected || !page || page.isClosed();
-    if (needReopen) {
-      try {
-        await openWhatsAppWindow();
-      } catch (e) {
-        return res.status(503).json({
-          error: 'Could not open WhatsApp Web. Please try again.',
-        });
-      }
+    // Reopen browser if crashed
+    if (!browser || !browser.connected || !page || page.isClosed()) {
+      console.log('Browser not ready, reopening...');
+      await openWhatsAppWindow();
     }
 
-    if (!page) {
-      return res.status(503).json({
-        error: 'WhatsApp Web not ready. Scan QR code and keep the service running.',
-      });
-    }
-
-    // If page was closed after the check above (e.g. user closed window), reopen so QR page is visible
-    if (page.isClosed()) {
-      try {
-        await openWhatsAppWindow();
-      } catch (e) {
-        return res.status(503).json({
-          error: 'Could not open WhatsApp Web. Please try again.',
-        });
-      }
-    }
-
-    // Wait for initial WhatsApp Web load so we don't get "Requesting main frame too early!"
-    if (initialPageReadyPromise) {
-      await initialPageReadyPromise;
-      initialPageReadyPromise = null;
-    }
-
-    // Bring WhatsApp window to front so user sees it (QR page or chat)
-    try {
-      await page.bringToFront();
-    } catch (e) {}
-    await sleep(500);
-
-    // Check if already logged in; if not, we're on QR page — wait for user to scan (up to 3 min)
-    const loggedInSelectors = [
-      '[data-testid="chat-list"]', '#pane-side', '#side', 'header [data-testid="search"]',
-      '[data-testid="default-user"]', 'div[role="textbox"][contenteditable="true"]',
-      '[data-testid="menu-bar-menu"]', 'div[data-testid="drawer-right"]', 'aside',
-      '[role="textbox"]', 'footer [role="button"]', 'div[contenteditable="true"][data-tab="1"]',
-    ];
-    let loggedIn = false;
-    try {
-      if (!page.isClosed()) {
-        loggedIn = await page.evaluate((sels) => sels.some((s) => document.querySelector(s)), loggedInSelectors);
-      }
-    } catch (e) {}
-    if (!loggedIn) {
-      if (page.isClosed()) {
-        try {
-          await openWhatsAppWindow();
-        } catch (e) {
-          return res.status(503).json({
-            error: 'Could not open WhatsApp Web. Please try again.',
-          });
-        }
-      }
+    // Check login
+    isLoggedIn = await checkLoggedIn();
+    if (!isLoggedIn) {
+      // Wait up to 3 minutes for QR scan
+      console.log('Waiting for QR scan...');
       try {
         await page.waitForFunction(
           (sels) => sels.some((s) => document.querySelector(s)),
           { timeout: 180000 },
-          loggedInSelectors
+          LOGGED_IN_SELECTORS
         );
+        isLoggedIn = true;
       } catch (e) {
         return res.status(503).json({
-          error: 'Please scan the QR code in the WhatsApp Web window, then try again.',
+          error: 'Not logged in. Open http://YOUR_SERVER:3000/qr in browser, scan QR code, then retry.',
         });
       }
     }
 
-    // Open chat WITHOUT pre-filled text so we attach PDF first, then add message (avoids sending text-only)
-    const chatUrl = `https://web.whatsapp.com/send?phone=${phone}`;
-    await page.goto(chatUrl, { waitUntil: 'networkidle2', timeout: 45000 });
+    console.log(`📤 Sending to ${phone}, file: ${resolvedPath}`);
 
-    await sleep(DELAY_MS);
-    await sleep(2500);
-
-    const continueClicked = await page.evaluate(() => {
-      const links = Array.from(document.querySelectorAll('a, button, [role="button"]'));
-      const t = (el) => (el.textContent || '').toLowerCase();
-      const msg = links.find(el => /continue to chat|message|start chat|chat/.test(t(el)));
-      if (msg) { msg.click(); return true; }
-      return false;
+    // Navigate to chat
+    await page.goto(`https://web.whatsapp.com/send?phone=${phone}`, {
+      waitUntil: 'networkidle2',
+      timeout: 45000,
     });
-    if (continueClicked) await sleep(1500);
+    await sleep(3000);
 
-    const inputArea = 'div[contenteditable="true"][data-tab="1"]';
+    // Click "Continue" if prompted
+    await page.evaluate(() => {
+      const els = Array.from(document.querySelectorAll('a,button,[role="button"]'));
+      const el = els.find(e => /continue|start chat|message/i.test(e.textContent));
+      if (el) el.click();
+    });
+    await sleep(1500);
+
+    // Wait for input box
+    const inputSel = 'div[contenteditable="true"][data-tab="1"]';
     const inputFallback = 'footer div[contenteditable="true"]';
     try {
-      await page.waitForSelector(inputArea, { timeout: 15000 });
+      await page.waitForSelector(inputSel, { timeout: 15000 });
     } catch (e) {
       await page.waitForSelector(inputFallback, { timeout: 8000 });
     }
 
-    const clipSelectors = [
+    // Click attach button
+    const attachSelectors = [
       'span[data-icon="attach-menu-plus"]',
-      'div[data-testid="conversation-clip"]',
+      '[data-testid="conversation-clip"]',
       '[data-testid="conversation-clip-plus"]',
       'span[data-icon="clip"]',
-      'div[role="button"][aria-label*="attach"]',
-      'div[role="button"][aria-label*="Attach"]',
-      'button[aria-label*="attach"]',
-      'button[aria-label*="Attach"]',
-      'footer button',
-      'footer [role="button"]',
+      'div[role="button"][aria-label*="ttach"]',
+      'button[aria-label*="ttach"]',
     ];
-    const clipTimeout = 6000;
-    let clipEl = null;
-    for (const sel of clipSelectors) {
+    let attached = false;
+    for (const sel of attachSelectors) {
       try {
-        clipEl = await page.waitForSelector(sel, { timeout: clipTimeout });
-        if (clipEl) break;
-      } catch (e) {
-        continue;
-      }
+        const el = await page.waitForSelector(sel, { timeout: 4000 });
+        if (el) { await el.click(); await sleep(1000); attached = true; break; }
+      } catch (e) { continue; }
     }
-    if (!clipEl) {
-      const clicked = await page.evaluate(() => {
+    if (!attached) {
+      await page.evaluate(() => {
         const footer = document.querySelector('footer');
-        if (!footer) return false;
-        const plus = Array.from(footer.querySelectorAll('*')).find(el => (el.getAttribute('data-icon') && el.getAttribute('data-icon').includes('attach')) || el.textContent === '+');
-        if (plus) { plus.click(); return true; }
-        const btn = footer.querySelector('[data-icon]') || footer.querySelector('button') || footer.querySelector('[role="button"]');
-        if (btn) { btn.click(); return true; }
-        return false;
+        if (!footer) return;
+        const btn = footer.querySelector('[data-icon]') || footer.querySelector('[role="button"]');
+        if (btn) btn.click();
       });
-      if (!clicked) return res.status(500).json({ error: 'Attach button not found' });
       await sleep(1000);
-    } else {
-      await clipEl.click();
-      await sleep(800);
     }
-
-    // Wait for attach menu to fully render
     await sleep(1200);
 
+    // Find and click Document option, then upload file
     let fileAttached = false;
+
+    // Try file chooser approach
     const docSelectors = [
       'li[data-testid="mi-attach-document"]',
       '[data-testid="mi-attach-document"]',
-      'li[data-icon="document"]',
-      'span[data-icon="document"]',
-      'div[role="button"][aria-label*="Document"]',
-      'div[role="button"][aria-label*="document"]',
-      'button[aria-label*="Document"]',
-      'button[aria-label*="document"]',
       '[data-icon="document"]',
-      'li span[data-icon="document"]',
-      'div[role="menu"] li',
-      'ul li[role="option"]',
+      'div[role="button"][aria-label*="ocument"]',
+      'button[aria-label*="ocument"]',
     ];
-    let docEl = null;
+
     for (const sel of docSelectors) {
       try {
         const el = await page.$(sel);
         if (el) {
-          const text = await page.evaluate(e => (e.textContent || e.getAttribute('aria-label') || '').toLowerCase(), el);
-          if (sel.includes('document') || sel.includes('Document') || text.includes('document')) {
-            docEl = el;
-            break;
-          }
+          const [fileChooser] = await Promise.all([
+            page.waitForFileChooser({ timeout: 6000 }),
+            el.click(),
+          ]);
+          await fileChooser.accept([resolvedPath]);
+          fileAttached = true;
+          console.log('✅ File attached via fileChooser');
+          break;
         }
-      } catch (e) {
-        continue;
-      }
-    }
-    if (!docEl) {
-      const fileChooserPromise = page.waitForFileChooser({ timeout: 6000 });
-      const clickedByText = await page.evaluate(() => {
-        const all = document.querySelectorAll('[role="button"], [role="menuitem"], li, button, div[data-testid]');
-        for (const el of all) {
-          const t = (el.textContent || el.getAttribute('aria-label') || '').toLowerCase();
-          if (t.trim() === 'document' || (t.includes('document') && t.length < 30)) {
-            el.click();
-            return true;
-          }
-        }
-        return false;
-      });
-      if (!clickedByText) {
-        return res.status(500).json({ error: 'Document option not found in attach menu' });
-      }
-      try {
-        const chooser = await fileChooserPromise;
-        await chooser.accept([resolvedPath]);
-        fileAttached = true;
-      } catch (e) {
-        fileAttached = false;
-      }
-      docEl = true;
+      } catch (e) { continue; }
     }
 
-    // Prefer file chooser when clicking Document (most reliable); fallback to hidden input
-    if (docEl && docEl !== true) {
+    // Fallback: click by text content
+    if (!fileAttached) {
       try {
         const [fileChooser] = await Promise.all([
-          page.waitForFileChooser({ timeout: 8000 }),
-          docEl.click(),
+          page.waitForFileChooser({ timeout: 6000 }),
+          page.evaluate(() => {
+            const all = document.querySelectorAll('[role="button"],[role="menuitem"],li,button');
+            for (const el of all) {
+              const t = (el.textContent || el.getAttribute('aria-label') || '').toLowerCase();
+              if (t.includes('document')) { el.click(); return true; }
+            }
+            return false;
+          }),
         ]);
         await fileChooser.accept([resolvedPath]);
         fileAttached = true;
+        console.log('✅ File attached via text click');
       } catch (e) {
-        await docEl.click();
-        await sleep(1000);
-        const inputs = await page.$$('input[type="file"]');
-        const lastInput = inputs.length ? inputs[inputs.length - 1] : null;
-        if (lastInput) {
-          await lastInput.uploadFile(resolvedPath);
-          fileAttached = true;
-        }
+        console.log('File chooser fallback failed:', e.message);
       }
     }
+
+    // Last resort: hidden input
     if (!fileAttached) {
-      await sleep(800);
       const inputs = await page.$$('input[type="file"]');
-      const lastInput = inputs.length ? inputs[inputs.length - 1] : null;
-      if (lastInput) {
-        await lastInput.uploadFile(resolvedPath);
+      if (inputs.length) {
+        await inputs[inputs.length - 1].uploadFile(resolvedPath);
         fileAttached = true;
+        console.log('✅ File attached via hidden input');
       }
     }
+
     if (!fileAttached) {
-      return res.status(500).json({ error: 'Could not attach PDF (file chooser or input not available)' });
+      return res.status(500).json({ error: 'Could not attach PDF' });
     }
 
     await sleep(2500);
 
-    // Type the message after the file is attached (so both PDF + text are sent together)
+    // Type caption
     const caption = message || 'Please find your invoice attached.';
-    const inputSel = await page.$(inputArea) || await page.$(inputFallback);
-    if (inputSel && caption) {
-      await inputSel.click();
-      await page.keyboard.type(caption, { delay: 30 });
-      await sleep(300);
-    }
+    try {
+      const inputEl = await page.$(inputSel) || await page.$(inputFallback);
+      if (inputEl) {
+        await inputEl.click();
+        await page.keyboard.type(caption, { delay: 30 });
+        await sleep(500);
+      }
+    } catch (e) {}
 
+    // Send
+    let sent = false;
     const sendSelectors = [
       'button[data-testid="send"]',
       'span[data-icon="send"]',
       '[data-testid="send"]',
       'button[aria-label*="Send"]',
-      'button[aria-label*="send"]',
-      'footer button[aria-label]',
-      'footer span[data-icon="send"]',
     ];
-    let sendBtn = null;
     for (const sel of sendSelectors) {
       try {
-        await page.waitForSelector(sel, { timeout: 5000, visible: true });
-        sendBtn = await page.$(sel);
-        if (sendBtn) break;
-      } catch (e) {
-        continue;
-      }
-    }
-    if (!sendBtn) {
-      const clicked = await page.evaluate(() => {
-        const footer = document.querySelector('footer');
-        if (!footer) return false;
-        const sendIcon = footer.querySelector('span[data-icon="send"]');
-        if (sendIcon) { sendIcon.scrollIntoView(); sendIcon.click(); return true; }
-        const btns = footer.querySelectorAll('button');
-        for (const b of btns) {
-          const label = (b.getAttribute('aria-label') || '').toLowerCase();
-          if (label.includes('send') || label.includes('submit')) { b.scrollIntoView(); b.click(); return true; }
+        const btn = await page.waitForSelector(sel, { timeout: 5000, visible: true });
+        if (btn) {
+          await btn.evaluate(el => el.scrollIntoView());
+          await sleep(300);
+          await btn.click({ delay: 100 });
+          sent = true;
+          break;
         }
-        const lastBtn = footer.querySelector('button:last-of-type');
-        if (lastBtn) { lastBtn.scrollIntoView(); lastBtn.click(); return true; }
-        return false;
-      });
-      if (!clicked) {
-        await page.keyboard.press('Enter');
-        await sleep(500);
-      }
-    } else {
-      await sendBtn.evaluate((el) => el.scrollIntoView());
-      await sleep(300);
-      await sendBtn.click({ delay: 100 });
+      } catch (e) { continue; }
     }
-    // With attachment in chat, Enter triggers send — press it so message goes automatically
-    await page.keyboard.press('Enter');
-    await sleep(300);
-
-    dailyCount++;
+    if (!sent) {
+      await page.keyboard.press('Enter');
+    }
     await sleep(1500);
 
-    res.json({ success: true, message: 'Invoice sent via WhatsApp' });
+    dailyCount++;
+    console.log(`✅ Sent to ${phone}. Daily count: ${dailyCount}`);
+    res.json({ success: true, message: 'Invoice sent via WhatsApp', dailyCount });
+
   } catch (err) {
-    console.error('[/send-invoice]', err);
+    console.error('[/send-invoice] ERROR:', err);
     res.status(500).json({ error: err.message || String(err) });
   }
 });
 
-app.get('/health', (req, res) => {
-  if (!page) {
-    return res.status(503).json({ ok: false, error: 'Browser not ready yet' });
-  }
-  res.json({
-    ok: true,
-    browser: !!browser,
-    page: !!page,
-    dailyCount,
-    limit: DAILY_LIMIT,
-  });
+// ─── Start ────────────────────────────────────────────────────────────────────
+app.listen(3000, '0.0.0.0', () => {
+  console.log('Server listening on http://0.0.0.0:3000');
 });
 
 (async () => {
   try {
     await openWhatsAppWindow();
-    console.log('📱 Scan QR code in the browser once, then keep this window open.');
-    console.log('🚀 WhatsApp Automation Service running on http://localhost:3000');
-    console.log('   POST /send-invoice — send invoice (phone, file_path, message)');
-    console.log('   GET  /health      — check status');
+    console.log('');
+    console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+    console.log('  GET  /qr           → view QR in browser');
+    console.log('  GET  /status       → check login state');
+    console.log('  GET  /health       → health check');
+    console.log('  POST /send-invoice → send PDF via WhatsApp');
+    console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+    if (!isLoggedIn) {
+      console.log('');
+      console.log('⚠️  NOT LOGGED IN!');
+      console.log('   Open this URL in your browser to scan QR:');
+      console.log('   http://YOUR_SERVER_IP:3000/qr');
+      console.log('   (Open port 3000 in AWS Security Group first)');
+    }
   } catch (err) {
-    console.error('Failed to start browser:', err);
+    console.error('Failed to start:', err);
     process.exit(1);
   }
 })();
-
-app.listen(3000, '0.0.0.0', () => {
-  console.log('Server listening on http://0.0.0.0:3000 (use http://127.0.0.1:3000 from Odoo)');
-});
